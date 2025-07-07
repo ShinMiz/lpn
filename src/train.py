@@ -75,6 +75,27 @@ class Trainer:
             state = state.replace(step=old_num_steps + 1)
             return state, metrics
 
+        def train_one_step_accumulate_encoder_only(state, batch, key):
+            grad_acc = self.gradient_accumulation_steps
+            batches = tree_map(lambda x: x.reshape(grad_acc, x.shape[0] // grad_acc, *x.shape[1:]), batch)
+            keys = jax.random.split(key, grad_acc)
+            old_num_steps = state.step
+            state, metrics = jax.lax.scan(lambda s, b_k: self.train_one_step_encoder_only(s, *b_k), state, (batches, keys))
+            # Update the step count manually to account for gradient accumulation
+            state = state.replace(step=old_num_steps + 1)
+            return state, metrics
+
+        # エンコーダーのみ学習用のpmap関数
+        self.pmap_train_steps_encoder_only = jax.pmap(
+            lambda state, batches, keys: jax.lax.scan(
+                lambda s, b_k: train_one_step_accumulate_encoder_only(s, *b_k),
+                state,
+                (batches, keys),
+            ),
+            axis_name="devices",
+            devices=self.devices,
+        )
+
         self.pmap_train_steps = jax.pmap(
             lambda state, batches, keys: jax.lax.scan(
                 lambda s, b_k: train_one_step_accumulate(s, *b_k),
@@ -353,6 +374,45 @@ class Trainer:
         metrics.update(grad_norm=optax.global_norm(grads))
         return state, metrics
 
+    def train_one_step_encoder_only(
+        self, state: TrainState, batch: tuple[chex.Array, chex.Array], key: chex.PRNGKey
+    ) -> tuple[TrainState, dict]:
+        """エンコーダーのみを学習するステップ"""
+        pairs, grid_shapes = batch
+        grads, metrics = jax.grad(state.apply_fn, has_aux=True)(
+            {"params": state.params},
+            pairs,
+            grid_shapes,
+            dropout_eval=False,
+            prior_kl_coeff=self.prior_kl_coeff,
+            pairwise_kl_coeff=self.pairwise_kl_coeff,
+            mode=self.train_inference_mode,
+            rngs=key,
+            **self.train_inference_kwargs,
+        )
+        grads = grads["params"]
+
+        # デコーダーの勾配をゼロに設定（エンコーダーのみを学習）
+        grads = grads.copy({
+            "decoder": jax.tree_map(jnp.zeros_like, grads["decoder"])
+        })
+
+        grads = jax.lax.pmean(grads, axis_name="devices")
+        state = state.apply_gradients(grads=grads)
+        metrics.update(grad_norm=optax.global_norm(grads))
+        return state, metrics
+
+    def train_n_steps_encoder_only(
+        self, state: TrainState, batches: tuple[chex.Array, chex.Array], key: chex.PRNGKey
+    ) -> tuple[TrainState, dict]:
+        """エンコーダーのみを学習するNステップ"""
+        num_devices, num_steps = batches[0].shape[0:2]
+        keys = jax.random.split(key, (num_devices, num_steps))
+        state, metrics = self.pmap_train_steps_encoder_only(state, batches, keys)
+        # Mean the metrics over the devices and the n mini-batches
+        metrics = tree_map(jnp.mean, metrics)
+        return state, metrics
+
     def train_n_steps(
         self, state: TrainState, batches: tuple[chex.Array, chex.Array], key: chex.PRNGKey
     ) -> tuple[TrainState, dict]:
@@ -622,7 +682,11 @@ class Trainer:
             # Training
             key, train_key = jax.random.split(key)
             start = time.time()
-            state, metrics = self.train_n_steps(state, batches, train_key)
+            # エンコーダーのみ学習モードかどうかをチェック
+            if cfg.training.get("encoder_only", False):
+                state, metrics = self.train_n_steps_encoder_only(state, batches, train_key)
+            else:
+                state, metrics = self.train_n_steps(state, batches, train_key)
             end = time.time()
             trange.update(log_every_n_steps)
             self.num_steps += log_every_n_steps

@@ -1,0 +1,26 @@
+# エンコーダーのみ学習用の設定ファイル
+# @package _global_
+
+defaults:
+  - task_gen  # ベース設定を継承
+
+training:
+  encoder_only: true  # エンコーダーのみ学習モード
+  learning_rate: 1e-3  # エンコーダー学習用の学習率
+  batch_size: 32
+  
+  # エンコーダー固有の設定
+  prior_kl_coeff: 1e-4  # 事前分布KL係数
+  pairwise_kl_coeff: 1e-5  # ペアワイズKL係数
+  
+  # 学習モード（エンコーダーのみなので変分推論関連が重要）
+  inference_mode: "mean"
+  inference_kwargs: {}
+
+# 実験名にencoder_onlyを追加
+experiment_name: "encoder_only_${training.learning_rate}_${training.batch_size}"
+
+# ログ設定
+wandb:
+  group: "encoder_only_experiments"
+  tags: ["encoder_only", "ablation"]
